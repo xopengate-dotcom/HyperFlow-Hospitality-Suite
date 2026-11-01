@@ -1,0 +1,438 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} { 
+      allow read, write: if false; 
+    }
+
+    // Phase 3: Primitive Definition
+    function isValidId(id) { 
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-\\.]+$'); 
+    }
+    
+    function incoming() { 
+      return request.resource.data; 
+    }
+    
+    function existing() { 
+      return resource.data; 
+    }
+    
+    function isSignedIn() { 
+      return request.auth != null; 
+    }
+
+    function isAdmin() {
+      // Bootstrapped admin or dynamic admins
+      return isSignedIn() && (
+        (request.auth.token.email != null && (request.auth.token.email.lower() == 'xopengate@gmail.com' || request.auth.token.email.lower() == 'x.opengate@gmail.com')) || 
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        (exists(/databases/$(database)/documents/operators/$(request.auth.uid)) && 
+         (get(/databases/$(database)/documents/operators/$(request.auth.uid)).data.get('isAdmin', false) == true || 
+          get(/databases/$(database)/documents/operators/$(request.auth.uid)).data.get('role', '') == 'admin'))
+      );
+    }
+    
+    function isOperator() {
+      return isSignedIn() && (exists(/databases/$(database)/documents/operators/$(request.auth.uid)) || isAdmin());
+    }
+    
+    function hasAccess() {
+      return isAdmin() || isOperator();
+    }
+
+    function canEditCashflow() {
+      return isAdmin() || (exists(/databases/$(database)/documents/operators/$(request.auth.uid)) && 
+        get(/databases/$(database)/documents/operators/$(request.auth.uid)).data.get('permissions', {}).get('cashflowEdit', false) == true);
+    }
+
+    // Validation Blueprints
+    function isValidOperator(data) {
+      let hasBaseKeys = data.keys().hasAll(['name', 'email', 'createdAt']);
+      let allowedKeys = ['name', 'email', 'createdAt', 'hideFinancials', 'isAdmin', 'role', 'permissions'];
+      return isAdmin() || (
+hasBaseKeys
+             && allowedKeys.hasAll(data.keys())
+             && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+             && data.email is string && data.email.size() > 0 && data.email.size() <= 150
+             && data.createdAt is timestamp
+             && (!data.keys().hasAll(['hideFinancials']) || data.hideFinancials is bool)
+             && (!data.keys().hasAll(['isAdmin']) || data.isAdmin is bool)
+             && (!data.keys().hasAll(['role']) || data.role in ['magazzino', 'acquisti', 'admin'])
+             && (!data.keys().hasAll(['permissions']) || data.permissions is map)
+      );
+    }
+
+    function isValidItem(data) {
+      let hasBaseKeys = data.keys().hasAll(['name', 'category', 'quantity']);
+      
+      return isAdmin() || (
+hasBaseKeys 
+             && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+             && data.category is string && data.category.size() >= 0 && data.category.size() <= 50
+             && data.quantity is number && (data.quantity >= 0 || data.category == 'Biancheria' || data.category == 'noleggio' || data.category == 'Noleggio' || data.category == 'NOLEGGIO')
+             && (!data.keys().hasAll(['unit']) || (data.unit is string && data.unit.size() >= 0 && data.unit.size() <= 20))
+             && (!data.keys().hasAll(['createdAt']) || data.createdAt is timestamp)
+             && (!data.keys().hasAll(['updatedAt']) || data.updatedAt is timestamp)
+             && (!data.keys().hasAll(['price']) || (data.price is number && data.price >= 0))
+             && (!data.keys().hasAll(['minQuantity']) || (data.minQuantity is number && data.minQuantity >= 0))
+             && (!data.keys().hasAll(['imageUrl']) || (data.imageUrl is string && data.imageUrl.size() <= 700000))
+             && (!data.keys().hasAll(['property']) || (data.property is string && data.property.size() <= 100))
+             && (!data.keys().hasAll(['barcode']) || (data.barcode is string && data.barcode.size() <= 100))
+             && (!data.keys().hasAll(['apartments']) || data.apartments is list)
+             && (!data.keys().hasAll(['visibleInApartments']) || data.visibleInApartments is list)
+             && (!data.keys().hasAll(['showInHousekeeping']) || data.showInHousekeeping is bool)
+      );
+    }
+
+    function isValidTransaction(data) {
+      let isBaseValid = data.keys().hasAll(['itemId', 'itemName', 'type', 'quantity', 'date', 'userId']);
+      let allowedKeys = ['itemId', 'itemName', 'type', 'quantity', 'date', 'userId', 'apartment', 'pricePerUnit', 'operator', 'notes', 'property', 'apartmentOwnerSnapshot'];
+      
+      return isAdmin() || (
+isBaseValid 
+             && allowedKeys.hasAll(data.keys())
+             && isValidId(data.itemId)
+             && data.itemName is string && data.itemName.size() > 0 && data.itemName.size() <= 100
+             && data.type is string && (data.type == 'in' || data.type == 'out' || data.type == 'edit')
+             && data.quantity is number && data.quantity >= 0
+             && data.date is timestamp
+             && data.userId is string && (data.userId == request.auth.uid || data.userId == '')
+             && (!data.keys().hasAll(['apartment']) || (data.apartment is string && data.apartment.size() <= 50))
+             && (!data.keys().hasAll(['pricePerUnit']) || (data.pricePerUnit is number && data.pricePerUnit >= 0))
+             && (!data.keys().hasAll(['operator']) || (data.operator is string && data.operator.size() <= 100))
+             && (!data.keys().hasAll(['notes']) || (data.notes is string && data.notes.size() <= 1000))
+             && (!data.keys().hasAll(['property']) || (data.property is string && data.property.size() <= 100))
+             && (!data.keys().hasAll(['apartmentOwnerSnapshot']) || (data.apartmentOwnerSnapshot is string && data.apartmentOwnerSnapshot.size() <= 100))
+      );
+    }
+
+    function isValidRestockOrder(data) {
+      let isBaseValid = data.keys().hasAll(['orderNumber', 'requestedBy', 'items', 'status', 'createdAt']);
+      
+      return isAdmin() || (
+isBaseValid
+             && data.orderNumber is string && data.orderNumber.size() > 0 && data.orderNumber.size() <= 50
+             && data.requestedBy is string && data.requestedBy.size() > 0 && data.requestedBy.size() <= 100
+             && data.items is list && data.items.size() > 0 && data.items.size() <= 100
+             && data.status is string && (data.status == 'pending' || data.status == 'purchased' || data.status == 'fulfilled')
+             && data.createdAt is timestamp
+             && (!data.keys().hasAll(['totalCost']) || (data.totalCost is number && data.totalCost >= 0))
+             && (!data.keys().hasAll(['purchasedAt']) || data.purchasedAt is timestamp)
+             && (!data.keys().hasAll(['fulfilledAt']) || data.fulfilledAt is timestamp)
+             && (!data.keys().hasAll(['property']) || (data.property is string && data.property.size() <= 100))
+      );
+    }
+
+    function isValidCashflow(data) {
+      let isBaseValid = data.keys().hasAll(['apartment', 'date', 'type', 'category', 'amount', 'operator', 'createdAt', 'updatedAt']);
+      let allowedKeys = ['apartment', 'property', 'apartmentOwnerSnapshot', 'date', 'type', 'category', 'amount', 'description', 'receiptUrl', 'operator', 'createdAt', 'updatedAt', 'itemId', 'itemQuantity', 'isLiquidation', 'items'];
+      
+      return isAdmin() || (
+isBaseValid
+             && allowedKeys.hasAll(data.keys())
+             && data.apartment is string && data.apartment.size() >= 0 && data.apartment.size() <= 100
+             && (!data.keys().hasAll(['property']) || (data.property is string && data.property.size() <= 100))
+             && (!data.keys().hasAll(['apartmentOwnerSnapshot']) || (data.apartmentOwnerSnapshot is string && data.apartmentOwnerSnapshot.size() <= 100))
+             && data.date is timestamp
+             && data.type is string && (data.type == 'income' || data.type == 'expense')
+             && data.category is string && data.category.size() > 0 && data.category.size() <= 100
+             && data.amount is number && data.amount >= 0
+             && data.operator is string && data.operator.size() > 0 && data.operator.size() <= 100
+             && data.createdAt is timestamp
+             && data.updatedAt is timestamp
+             && (!data.keys().hasAll(['description']) || (data.description is string && data.description.size() <= 1000))
+             && (!data.keys().hasAll(['receiptUrl']) || (data.receiptUrl is string && data.receiptUrl.size() <= 1048576))
+             && (!data.keys().hasAll(['itemId']) || isValidId(data.itemId))
+             && (!data.keys().hasAll(['itemQuantity']) || (data.itemQuantity is number && data.itemQuantity > 0))
+             && (!data.keys().hasAll(['items']) || (data.items is list))
+      );
+    }
+
+    function isValidSettings(data) {
+      let isBaseValid = true; 
+      let allowedKeys = ['incomeCategories', 'expenseCategories', 'properties', 'apartments', 'propertyApartments', 'apartmentProperty', 'updatedAt', 'workCategories', 'timestamp', 'version', 'author'];
+
+      return isAdmin() || (
+allowedKeys.hasAll(data.keys())
+             && (!data.keys().hasAll(['workCategories']) || (data.workCategories is list && data.workCategories.size() >= 0 && data.workCategories.size() <= 60))
+             && (!data.keys().hasAll(['incomeCategories']) || (data.incomeCategories is list && data.incomeCategories.size() >= 0 && data.incomeCategories.size() <= 50))
+             && (!data.keys().hasAll(['expenseCategories']) || (data.expenseCategories is list && data.expenseCategories.size() >= 0 && data.expenseCategories.size() <= 50))
+             && (!data.keys().hasAll(['properties']) || (data.properties is list && data.properties.size() >= 0 && data.properties.size() <= 100))
+             && (!data.keys().hasAll(['apartments']) || (data.apartments is list && data.apartments.size() >= 0 && data.apartments.size() <= 100))
+             && (!data.keys().hasAll(['propertyApartments']) || data.propertyApartments is map)
+             && (!data.keys().hasAll(['apartmentProperty']) || data.apartmentProperty is map)
+             && (!data.keys().hasAll(['updatedAt']) || data.updatedAt is timestamp)
+             && (!data.keys().hasAll(['timestamp']) || data.timestamp is timestamp)
+             && (!data.keys().hasAll(['version']) || data.version is string)
+             && (!data.keys().hasAll(['author']) || data.author is string)
+      );
+    }
+
+    function isValidCashflowLog(data) {
+      let isBaseValid = data.keys().hasAll(['cashflowId', 'action', 'modifiedBy', 'modifiedById', 'timestamp', 'changes']);
+      let allowedKeys = ['cashflowId', 'action', 'modifiedBy', 'modifiedById', 'timestamp', 'changes'];
+      
+      return isAdmin() || (
+isBaseValid
+             && allowedKeys.hasAll(data.keys())
+             && isValidId(data.cashflowId)
+             && data.action is string && data.action in ['create', 'update', 'delete']
+             && data.modifiedBy is string && data.modifiedBy.size() <= 100
+             && data.modifiedById is string && data.modifiedById == request.auth.uid
+             && data.timestamp is timestamp
+             && data.changes is string && data.changes.size() <= 5000
+      );
+    }
+
+    function isValidCatalogItem(data) {
+      let hasBaseKeys = data.keys().hasAll(['name', 'category', 'createdAt', 'updatedAt']);
+      let allowedKeys = ['name', 'category', 'unit', 'imageUrl', 'barcode', 'createdAt', 'updatedAt', 'showInHousekeeping'];
+      
+      return isAdmin() || (
+hasBaseKeys
+             && allowedKeys.hasAll(data.keys())
+             && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+             && data.category is string && data.category.size() >= 0 && data.category.size() <= 50
+             && (!data.keys().hasAll(['unit']) || (data.unit is string && data.unit.size() >= 0 && data.unit.size() <= 20))
+             && data.createdAt is timestamp
+             && data.updatedAt is timestamp
+             && (!data.keys().hasAll(['imageUrl']) || (data.imageUrl is string && data.imageUrl.size() <= 700000))
+             && (!data.keys().hasAll(['barcode']) || (data.barcode is string && data.barcode.size() <= 100))
+             && (!data.keys().hasAll(['showInHousekeeping']) || data.showInHousekeeping is bool)
+      );
+    }
+
+    
+    function isValidWorkActivity(data) {
+      let isBaseValid = data.keys().hasAll(['date', 'apartment', 'category', 'amount', 'status', 'operator', 'createdAt', 'updatedAt']);
+      let allowedKeys = ['date', 'apartment', 'property', 'apartmentOwnerSnapshot', 'category', 'description', 'amount', 'hours', 'status', 'operator', 'liquidationId', 'createdAt', 'updatedAt'];
+      
+      return isAdmin() || (
+isBaseValid
+             && allowedKeys.hasAll(data.keys())
+             && data.date is timestamp
+             && data.apartment is string && data.apartment.size() >= 0 && data.apartment.size() <= 100
+             && (!data.keys().hasAll(['property']) || (data.property is string && data.property.size() <= 100))
+             && (!data.keys().hasAll(['apartmentOwnerSnapshot']) || (data.apartmentOwnerSnapshot is string && data.apartmentOwnerSnapshot.size() <= 100))
+             && data.category is string && data.category.size() > 0 && data.category.size() <= 100
+             && data.amount is number && data.amount >= 0
+             && (!data.keys().hasAll(['hours']) || (data.hours is number && data.hours >= 0))
+             && data.status is string && (data.status == 'pending' || data.status == 'liquidated')
+             && data.operator is string && data.operator.size() > 0 && data.operator.size() <= 100
+             && data.createdAt is timestamp
+             && data.updatedAt is timestamp
+             && (!data.keys().hasAll(['description']) || (data.description is string && data.description.size() <= 1000))
+             && (!data.keys().hasAll(['liquidationId']) || isValidId(data.liquidationId))
+      );
+    }
+
+    // Collection: Operators
+    match /operators/{operatorId} {
+      allow get: if hasAccess();
+      allow list: if isAdmin();
+      allow create: if isAdmin() && isValidOperator(incoming()) && (incoming().createdAt == request.time || isAdmin());
+      allow update: if isAdmin() && isValidOperator(incoming()) && (incoming().createdAt == existing().createdAt || isAdmin());
+      allow delete: if isAdmin() && isValidId(operatorId);
+    }
+
+    // Collection: CatalogItems
+    match /catalogItems/{itemId} {
+      allow get: if hasAccess() && isValidId(itemId);
+      allow list: if hasAccess();
+      
+      allow create: if hasAccess() 
+                    && isValidId(itemId) 
+                    && isValidCatalogItem(incoming()) 
+                    && (incoming().createdAt == request.time || isAdmin())
+                    && (incoming().updatedAt == request.time || isAdmin());
+      
+      allow update: if hasAccess() 
+                    && isValidId(itemId)
+                    && isValidCatalogItem(incoming())
+                    && (incoming().createdAt == existing().createdAt || isAdmin())
+                    && (incoming().updatedAt == request.time || isAdmin())
+                    && (
+                       isAdmin() || 
+                       incoming().diff(existing()).affectedKeys().hasOnly(['name', 'category', 'unit', 'imageUrl', 'barcode', 'showInHousekeeping', 'updatedAt'])
+                    );
+                    
+      allow delete: if isAdmin() && isValidId(itemId);
+    }
+
+    // Collection: Items
+    match /items/{itemId} {
+      allow get: if hasAccess() && isValidId(itemId);
+      allow list: if hasAccess();
+      
+      allow create: if hasAccess() 
+                    && isValidId(itemId) 
+                    && isValidItem(incoming()) 
+                    && (incoming().createdAt == request.time || isAdmin())
+                    && (incoming().updatedAt == request.time || isAdmin());
+      
+      allow update: if hasAccess() 
+                    && isValidId(itemId)
+                    && isValidItem(incoming())
+                    && (!existing().keys().hasAll(['createdAt']) || (incoming().createdAt == existing().createdAt || isAdmin()))
+                    && (
+                       isAdmin() || 
+                       (incoming().updatedAt == request.time && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'category', 'quantity', 'unit', 'updatedAt', 'price', 'minQuantity', 'imageUrl', 'property', 'barcode', 'apartments', 'showInHousekeeping', 'visibleInApartments']))
+                    );
+                    
+      allow delete: if hasAccess() && isValidId(itemId);
+    }
+
+    // Collection: Transactions
+    match /transactions/{transactionId} {
+      allow get: if hasAccess() && isValidId(transactionId);
+      allow list: if hasAccess();
+      
+      allow create: if hasAccess() 
+                    && isValidId(transactionId) 
+                    && isValidTransaction(incoming())
+                    && (incoming().date == request.time || isAdmin());
+      
+      allow update: if isAdmin(); // Transactions are immutable audit logs normally
+      allow delete: if isAdmin() && isValidId(transactionId);
+    }
+
+    // Collection: Admins
+    match /admins/{adminId} {
+      allow get: if isSignedIn() && isValidId(adminId);
+      allow list: if isAdmin();
+      allow write: if isAdmin();
+    }
+
+    // Collection: AuditLogs
+    match /auditLogs/{logId} {
+      allow create: if hasAccess();
+      allow read: if isAdmin();
+      allow update, delete: if isAdmin();
+    }
+
+    // Collection: RestockOrders
+    match /restockOrders/{orderId} {
+      allow get: if hasAccess() && isValidId(orderId);
+      allow list: if hasAccess();
+      
+      allow create: if hasAccess()
+                    && isValidId(orderId)
+                    && (incoming().createdAt == request.time || isAdmin())
+                    && (incoming().status == 'pending' || isAdmin());
+      
+      allow update: if hasAccess()
+                    && isValidId(orderId)
+                    && isValidRestockOrder(incoming())
+                    && (isAdmin() || (incoming().createdAt == existing().createdAt || isAdmin()))
+                    && (
+                      isAdmin() ||
+                      (incoming().diff(existing()).affectedKeys().hasOnly(['items', 'status', 'totalCost', 'purchasedAt', 'fulfilledAt']) &&
+                      ((existing().status == 'pending' && incoming().status == 'pending') ||
+                       (existing().status == 'pending' && incoming().status == 'purchased' && (incoming().purchasedAt == request.time || isAdmin())) ||
+                       (existing().status == 'purchased' && incoming().status == 'fulfilled' && (incoming().fulfilledAt == request.time || isAdmin()))
+                      ))
+                    );
+                    
+      allow delete: if isAdmin() && isValidId(orderId);
+    }
+    // Collection: Cashflows
+    match /cashflows/{cashflowId} {
+      allow get: if hasAccess() && isValidId(cashflowId);
+      allow list: if hasAccess();
+      
+      allow create: if canEditCashflow()
+                    && isValidId(cashflowId)
+                    && isValidCashflow(incoming())
+                    && (incoming().createdAt == request.time || isAdmin())
+                    && (incoming().updatedAt == request.time || isAdmin());
+      
+      allow update: if canEditCashflow()
+                    && isValidId(cashflowId)
+                    && isValidCashflow(incoming())
+                    && (!existing().keys().hasAll(['createdAt']) || (incoming().createdAt == existing().createdAt || isAdmin()))
+                    && (
+                       isAdmin() || 
+                       (incoming().updatedAt == request.time && incoming().diff(existing()).affectedKeys().hasOnly(['apartment', 'property', 'apartmentOwnerSnapshot', 'date', 'type', 'category', 'amount', 'description', 'receiptUrl', 'updatedAt', 'itemId', 'itemQuantity', 'isLiquidation', 'operator', 'createdAt', 'items']))
+                    );
+                    
+      allow delete: if canEditCashflow() && isValidId(cashflowId);
+    }
+    
+    // Collection: CashflowLogs
+    match /cashflowLogs/{logId} {
+      allow get: if hasAccess() && isValidId(logId);
+      allow list: if hasAccess();
+      
+      allow create: if canEditCashflow()
+                    && isValidId(logId)
+                    && isValidCashflowLog(incoming())
+                    && (incoming().timestamp == request.time || isAdmin());
+                    
+      allow update, delete: if isAdmin(); // Logs are immutable normally
+    }
+
+    
+    // Collection: WorkActivities
+    match /work_activities/{activityId} {
+      allow get: if hasAccess() && isValidId(activityId);
+      allow list: if hasAccess();
+      
+      allow create: if canEditCashflow() 
+                    && isValidId(activityId)
+                    && isValidWorkActivity(incoming())
+                    && (incoming().createdAt == request.time || isAdmin())
+                    && (incoming().updatedAt == request.time || isAdmin());
+      
+      allow update: if canEditCashflow()
+                    && isValidId(activityId)
+                    && isValidWorkActivity(incoming())
+                    && (!existing().keys().hasAll(['createdAt']) || (incoming().createdAt == existing().createdAt || isAdmin()))
+                    && (
+                       isAdmin() || 
+                       (incoming().updatedAt == request.time && incoming().diff(existing()).affectedKeys().hasOnly(['date', 'apartment', 'category', 'description', 'amount', 'hours', 'status', 'liquidationId', 'updatedAt', 'operator', 'createdAt']))
+                    );
+                    
+      allow delete: if canEditCashflow() && isValidId(activityId);
+    }
+
+    // Collection: Parking Reservations
+    match /parking_reservations/{reservationId} {
+      allow get: if hasAccess() && isValidId(reservationId);
+      allow list: if hasAccess();
+      
+      allow create: if hasAccess()
+                    && isValidId(reservationId)
+                    && (incoming().createdAt == request.time || isAdmin())
+                    && (incoming().updatedAt == request.time || isAdmin());
+      
+      allow update: if hasAccess()
+                    && isValidId(reservationId)
+                    && (incoming().updatedAt == request.time || isAdmin());
+                    
+      allow delete: if hasAccess() && isValidId(reservationId);
+    }
+
+    // Collection: Settings
+    match /settings/{settingId} {
+      allow get: if hasAccess() && isValidId(settingId);
+      allow list: if hasAccess();
+      allow create: if isAdmin()
+                    && isValidId(settingId)
+                    && isValidSettings(incoming())
+                    && (incoming().updatedAt == request.time || isAdmin());
+      allow update: if isAdmin()
+                    && isValidId(settingId)
+                    && isValidSettings(incoming())
+                    && (incoming().updatedAt == request.time || isAdmin());
+    }
+
+    // Collection: SystemLogs
+    match /systemLogs/{logId} {
+      allow create: if true;
+      allow read, update, delete: if isAdmin();
+    }
+  }
+}
